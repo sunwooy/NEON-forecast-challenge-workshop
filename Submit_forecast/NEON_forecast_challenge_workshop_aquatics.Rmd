@@ -44,6 +44,7 @@ install.packages('tsibble') # package for dealing with time series data sets and
 install.packages('tidyverse') # collection of R packages for data manipulation, analysis, and visualisation
 install.packages('lubridate') # working with dates and times
 remotes::install_github('eco4cast/neon4cast') # package from NEON4cast challenge organisers to assist with forecast building and submission
+
 ```
 
 Additionally, R version 4.2 is required to run the neon4cast package.
@@ -245,6 +246,7 @@ Then we can use the ensembles to produce uncertainty in the water temperature fo
 # New forecast only available at 5am UTC the next day
 
 forecast_date <- Sys.Date() 
+# Bump back one day because of way/time NOAA sends data
 noaa_date <- forecast_date - days(1)
 
 noaa_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
@@ -465,7 +467,7 @@ neon4cast::forecast_output_validator(forecast_file_1)
 
 ```{r eval = FALSE}
 # can uses the neon4cast::forecast_output_validator() to check the forecast is in the right format
-neon4cast::submit(forecast_file = forecast_file_1),
+neon4cast::submit(forecast_file = forecast_file_1,
                   ask = FALSE) # if ask = T (default), it will produce a pop-up box asking if you want to submit
 ```
 
