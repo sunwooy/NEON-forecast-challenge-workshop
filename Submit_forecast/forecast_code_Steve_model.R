@@ -1,11 +1,14 @@
 ## install.packages('remotes')
 ## install.packages('tidyverse') # collection of R packages for data manipulation, analysis, and visualisation
 ## install.packages('lubridate') # working with dates and times
+## install.packages('zoo')
 ## remotes::install_github('eco4cast/neon4cast') # package from NEON4cast challenge organisers to assist with forecast building and submission
 
 # ------ Load packages -----
 library(tidyverse)
 library(lubridate)
+library(zoo)
+
 #--------------------------#
 
 # Change this for your model ID
@@ -84,13 +87,17 @@ weather_future_daily <- weather_future |>
   mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
   pivot_wider(names_from = variable, values_from = prediction) |> 
   select(any_of(c('datetime', 'site_id', met_variables, 'parameter'))) |>
-  filter(datetime <= min(datetime) + days(6))
+  filter(datetime <= min(datetime) + days(6)) 
+
 
 
 targets_lm <- targets |> 
   pivot_wider(names_from = 'variable', values_from = 'observation') |> 
   left_join(weather_past_daily, 
-            by = c("datetime","site_id"))
+            by = c("datetime","site_id"))|>
+  mutate(wtemp_yday = lag(temperature))|>
+  mutate(airtemp_yday = rollapplyr(air_temperature, width=3, FUN=mean, fill=NA, align="right", na.rm=TRUE))
+
 
 forecast_df <- NULL
 
@@ -99,64 +106,131 @@ for(i in 1:length(focal_sites)) {
   
   curr_site <- focal_sites[i]
   
-  site_target <- targets_lm |> filter(site_id == curr_site)
-  noaa_future_site <- weather_future_daily |> filter(site_id == curr_site)
+  site_target <- targets_lm |> 
+    filter(site_id == curr_site) |> 
+    arrange(datetime)
+  # Future weather Forecasts from NOAA
+  noaa_future_site <- weather_future_daily |> 
+    mutate(parameter = as.character(parameter)) |>
+    filter(site_id == curr_site) |> 
+    arrange(parameter, datetime)
   
+  # Remove NAs to remove gap for lag air temp and water temp
+  fit_data <- site_target |> 
+    filter(
+      !is.na(temperature),
+      !is.na(air_temperature),
+      !is.na(wtemp_yday),
+      !is.na(airtemp_yday)
+    )
   
-  fit <- lm(temperature ~ air_temperature, data = site_target)
+  fit <- lm(temperature ~ air_temperature + wtemp_yday + airtemp_yday, data = fit_data)
   coeffs <- fit$coefficients
   fit_summary <- summary(fit)
   params_se <- fit_summary$coefficients[,2]
   
-  
-  residuals <- site_target$temperature - predict(fit)
+  residuals <- fit$residuals
   sigma <- sd(residuals, na.rm = TRUE)
   
+  n_members <- length(unique(noaa_future_site$parameter))
   
-  n_members <- 31
-  
-  # Parameter Uncertanity
+  # Parameter Uncertainty
   param_df <- tibble(
     parameter = unique(noaa_future_site$parameter),
     beta0 = rnorm(n_members, coeffs[1], params_se[1]),
-    beta1 = rnorm(n_members, coeffs[2], params_se[2])
+    beta1 = rnorm(n_members, coeffs[2], params_se[2]),
+    beta2 = rnorm(n_members, coeffs[3], params_se[3]),
+    beta3 = rnorm(n_members, coeffs[4], params_se[4])
   )
   
   
-  forecast_total_unc <- noaa_future_site %>%
-    left_join(param_df, by = "parameter") %>%
-    mutate(
-      forecast_date = datetime,
-      value = as.double(NA)
-    )
   
- 
-  forecasted_dates <- unique(forecast_total_unc$forecast_date)
+  # Pull the most recent observed lake temp before start of forecast for the lag in water temp
+  last_obs_wtemp <- site_target |> 
+    filter(datetime < forecast_date, !is.na(temperature)) |> 
+    arrange(datetime) |> 
+    slice_tail(n = 1) |> 
+    pull(temperature)
   
-  for(j in 1:length(forecasted_dates)) {
+  # Build df of Initial condition uncertainty
+  params <- unique(noaa_future_site$parameter)
+  ic_sd <- 0.1   
+  ic_df <- tibble(
+    parameter = params,
+    ic_value = rnorm(n = n_members, mean = last_obs_wtemp, sd = ic_sd)
+  )
+  
+  # Historical air temp for 3 day rolling air temp for later
+  air_hist <- site_target |> 
+    filter(!is.na(air_temperature)) |> 
+    arrange(datetime) |> 
+    select(datetime, air_temperature)
+  
+  site_forecasts <- list()
+  # For each NOAA ensemble member
+  for(p in unique(noaa_future_site$parameter)) {
     
-    temp_pred <- forecast_total_unc %>%
-      filter(forecast_date == forecasted_dates[j])
+    # Pull future air temperature from NOAA
+    future_member <- noaa_future_site |> 
+      filter(parameter == p) |> 
+      arrange(datetime)
     
-    temp_pred <- temp_pred %>%
-      mutate(
-        value = beta0 +
-          beta1 * air_temperature +
-          rnorm(n(), mean = 0, sd = sigma) #Process uncertanity
-      )
+    # Pull uncertainty calculated earlier
+    betas <- param_df |> 
+      filter(parameter == p)
     
-    forecast_total_unc <- forecast_total_unc %>%
-      rows_update(temp_pred, by = c("forecast_date","parameter"))
+    beta0 <- betas$beta0
+    beta1 <- betas$beta1
+    beta2 <- betas$beta2
+    beta3 <- betas$beta3
+    
+    # Pull  yesterday's water temp WITH initial condition uncertanity
+    prev_wtemp <- ic_df |> 
+      filter(parameter == p) |> 
+      pull(ic_value)
+    
+    # Since we're taking 3 day previous air temp INCLUDING NOAA's forecasted temp, merge past and future air temp
+    full_air <- bind_rows(
+      air_hist,
+      future_member |> 
+      select(datetime, air_temperature)) |> 
+      arrange(datetime)
+    
+    preds <- numeric(nrow(future_member))
+    
+    for(j in 1:nrow(future_member)) {
+      
+      curr_date <- future_member$datetime[j]
+      curr_air <- future_member$air_temperature[j]
+      
+      # Previous 3 days air temp mean then calculate mean
+      prev3_air <- full_air |> 
+        filter(datetime < curr_date) |> 
+        arrange(datetime) |> 
+        slice_tail(n = 3) |> 
+        pull(air_temperature)
+      
+      airtemp_yday <- mean(prev3_air, na.rm = TRUE)
+      
+      pred_val <- beta0 +
+        beta1 * curr_air +
+        beta2 * prev_wtemp +
+        beta3 * airtemp_yday +
+        rnorm(1, mean = 0, sd = sigma)   # process uncertainty
+      
+      preds[j] <- pred_val
+      
+      # update lagged water temp for next day with forecasted water temperature
+      prev_wtemp <- pred_val
+    }
+    
+    member_df <- future_member |> 
+      mutate(prediction = preds, variable = "temperature") |> 
+      select(datetime, site_id, parameter, variable, prediction)
+    site_forecasts[[as.character(p)]] <- member_df
   }
   
-  curr_site_df <- forecast_total_unc %>%
-    transmute(
-      datetime = forecast_date,
-      site_id = curr_site,
-      parameter = as.character(parameter),
-      prediction = value,
-      variable = "temperature")
-
+  curr_site_df <- bind_rows(site_forecasts)
   forecast_df <- bind_rows(forecast_df, curr_site_df)
   
   message(curr_site, " forecast complete")
