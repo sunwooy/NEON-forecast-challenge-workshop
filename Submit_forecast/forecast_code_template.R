@@ -11,7 +11,7 @@ library(lubridate)
 # Change this for your model ID
 # Include the word "example" in my_model_id for a test submission
 # Don't include the word "example" in my_model_id for a forecast that you have registered (see neon4cast.org for the registration form)
-my_model_id <- 'example_ID'
+my_model_id <- 'example_model'
 
 # --Model description--- #
 
@@ -25,6 +25,7 @@ my_model_id <- 'example_ID'
 # read in the targets data
 targets <- read_csv("https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz")
 
+
 # read in the sites data
 aquatic_sites <- read_csv("https://raw.githubusercontent.com/eco4cast/neon4cast-ci/refs/heads/main/neon4cast_field_site_metadata.csv") |>
   dplyr::filter(aquatics == 1)
@@ -34,6 +35,7 @@ focal_sites <- aquatic_sites |>
   pull(field_site_id)
 
 # Filter the targets
+# Date up to 2026-03-31
 targets <- targets %>%
   filter(site_id %in% focal_sites,
          variable == 'temperature')
@@ -61,6 +63,7 @@ weather_past_daily <- weather_past |>
   # convert air temperature to Celsius if it is included in the weather data
   mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
   pivot_wider(names_from = variable, values_from = prediction)
+
 
 # Future weather forecast --------
 # New forecast only available at 5am UTC the next day
@@ -100,6 +103,27 @@ targets_lm <- targets |>
 # Loop through each site to fit the model
 forecast_df <- NULL
 
+
+n_members = 31
+
+# # Get horizon length by looking at available forecast dates that is not today. 
+# forecast_horizon <- length(
+#   unique(weather_future_daily$datetime[weather_future_daily$datetime != forecast_date]))
+
+
+# forecasted_dates <- unique(weather_future_daily$datetime[weather_future_daily$datetime != forecast_date])
+
+forecasted_dates <- unique(weather_future_daily$datetime)
+forecast_start_date <- forecasted_dates[2]
+
+
+
+
+
+
+
+
+
 for(i in 1:length(focal_sites)) {  
   
   curr_site <- focal_sites[i]
@@ -113,12 +137,35 @@ for(i in 1:length(focal_sites)) {
   #Fit linear model based on past data: water temperature = m * air temperature + b
   #you will need to change the variable on the left side of the ~ if you are forecasting oxygen or chla
   fit <- lm(site_target$temperature ~ site_target$air_temperature)
-  # fit <- lm(site_target$temperature ~ ....)
+  fit_summary <- summary(fit)
+  
+  coeffs <- fit$coefficients
+  params_se <- fit_summary$coefficients[,2]
+  
+  mod <- predict(fit, data=site_target$air_temperature)
+  
+  r2 <- fit_summary$r.squared
+  residuals <- mod - site_target$temperature
+  err <- mean(residuals, na.rm = TRUE) 
+  rmse <- round(sqrt(mean((mod - site_target$temperature)^2, na.rm = TRUE)), 2) 
+  
+  
+  
+  # Parameter Uncertanity
+  param_df <- data.frame(beta1 = rnorm(n_members, coeffs[1], params_se[1]),
+                         beta2 = rnorm(n_members, coeffs[2], params_se[2]))
+  
+  # Process Uncertanity
+  sigma <- sd(residuals, na.rm = TRUE)
+  
+  
+  
+  
   
   # use linear regression to forecast water temperature for each ensemble member
   # You will need to modify this line of code if you add additional weather variables or change the form of the model
   # The model here needs to match the model used in the lm function above (or what model you used in the fit)
-  forecasted_temperature <- fit$coefficients[1] + fit$coefficients[2] * noaa_future_site$air_temperature
+  forecasted_temperature <- param_df$beta1 + param_df$beta2 * noaa_future_site$air_temperature + rnorm(n = n_members, mean = 0, sd = sigma)
   
   # put all the relevant information into a tibble that we can bind together
   curr_site_df <- tibble(datetime = noaa_future_site$datetime,
@@ -129,6 +176,8 @@ for(i in 1:length(focal_sites)) {
   
   forecast_df <- dplyr::bind_rows(forecast_df, curr_site_df)
   message(curr_site, 'forecast run')
+  
+  
   
 }
 
