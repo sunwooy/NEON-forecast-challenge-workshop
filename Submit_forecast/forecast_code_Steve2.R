@@ -227,7 +227,7 @@ for(i in 1:length(focal_sites)) {
     filter(datetime == forecast_start_date) %>%
     pull(temperature)
   
-  air_init <- weather_future_daily %>%
+  air_init <- weather_past_daily %>%
     filter(site_id == curr_site,
            datetime == forecast_start_date) %>%
     pull(air_temperature)
