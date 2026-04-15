@@ -25,8 +25,8 @@ my_model_id <- 'example_model'
 
 # Describe what sources of uncertainty are included in your forecast and how you estimate each source.
 
-# Driver, parameter, and process uncertanity are included in the model. In addition, because initial water temperature data are not available at forecast start date, we initiated 
-# water temperature as air temperature with uncertainty of 2C as initial conditions (normal distribution). 
+# Driver, parameter, and process uncertanity are included in the model. In addition, if initial water temperature data are not available at forecast start date, we initiated 
+# water temperature as air temperature with uncertainty of 2C as initial conditions (normal distribution). If avaialble, it's water temperature with uncertanity of 0.1C (norm)
 
 #------- Read data --------
 # read in the targets data
@@ -207,20 +207,47 @@ for(i in 1:length(focal_sites)) {
     ungroup()
   
   
-  # Most of our data is not up-to-date. Thus, we will have initial conditions as air temperature with 2C uncertanity.
+  # Most of our data is not up-to-date. Thus, we will check whether there is existing measurements.
+  # if there is current condition water temp, initial condition as water temp + 0.1C uncertanity. If not, initial conditions as air temperature with 2C uncertanity.
   
-  curr_wt <- weather_past_daily %>%
+  # curr_wt <- weather_past_daily %>%
+  #   filter(site_id == curr_site,
+  #          datetime == forecast_start_date) %>%
+  #   pull(air_temperature)
+  #   
+  # ic_sd <- 2
+  # ic_uc <- rnorm(n = n_members, mean = curr_wt, sd = ic_sd)
+  # ic_df <- tibble(forecast_date = rep(as.Date(forecast_start_date), times = n_members),
+  #                 ensemble_member = c(1:n_members),
+  #                 forecast_variable = "water_temperature",
+  #                 value = ic_uc,
+  #                 uc_type = "initial_conditions")
+  
+  obs_wt_init <- site_target %>%
+    filter(datetime == forecast_start_date) %>%
+    pull(temperature)
+  
+  air_init <- weather_future_daily %>%
     filter(site_id == curr_site,
            datetime == forecast_start_date) %>%
     pull(air_temperature)
-    
-  ic_sd <- 2
-  ic_uc <- rnorm(n = n_members, mean = curr_wt, sd = ic_sd)
-  ic_df <- tibble(forecast_date = rep(as.Date(forecast_start_date), times = n_members),
-                  ensemble_member = c(1:n_members),
-                  forecast_variable = "water_temperature",
-                  value = ic_uc,
-                  uc_type = "initial_conditions")
+  
+  if(length(obs_wt_init) > 0 && !is.na(obs_wt_init[1])) {
+    init_mean <- obs_wt_init[1]
+    ic_sd <- 0.1
+  } else {
+    init_mean <- air_init[1]
+    ic_sd <- 2
+  }
+  
+  ic_uc <- rnorm(n = n_members, mean = init_mean, sd = ic_sd)
+  
+  ic_df <- tibble(
+    forecast_date = rep(as.Date(forecast_start_date), times = n_members),
+    ensemble_member = 1:n_members,
+    forecast_variable = "water_temperature",
+    value = ic_uc
+  )
   
   
   
