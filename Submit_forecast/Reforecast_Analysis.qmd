@@ -1,0 +1,383 @@
+---
+title: "Reforecast_Quarto"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(slider)
+library(dplyr)
+library(tidyr)
+library(slider)
+library(tibble)
+library(scoringRules)
+library(duckdbfs)
+```
+
+```{r}
+targets <- read_csv("https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz")
+
+# Filter the targets, add water temp lag
+targets <- targets %>%
+  filter(site_id == "BARC",
+         variable == "temperature") 
+
+# %>%
+#   mutate(wtemp_yday = lag(observation))
+```
+
+```{r}
+# past stacked weather
+df_past <- neon4cast::noaa_stage3()
+
+variables <- c("air_temperature")
+
+noaa_past <- df_past |> 
+  dplyr::filter(site_id == "BARC",
+                datetime >= ymd('2017-01-01'),
+                variable == "air_temperature") |> 
+  dplyr::collect()
+
+
+# aggregate the past to mean values
+noaa_past_mean <- noaa_past |> 
+  mutate(datetime = as_date(datetime)) |> 
+  group_by(datetime, site_id, variable) |> 
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+  pivot_wider(names_from = variable, values_from = prediction) |> 
+  # convert air temp to C
+  mutate(air_temperature = air_temperature - 273.15)
+
+
+```
+
+```{r}
+ref_datetimes <- seq(as.Date("2024-01-01"), as.Date("2024-12-31"), by = "day")
+n_members <- 31
+forecast_df <- tibble()
+
+for (rd in ref_datetimes) {
+
+  reference_date <- as.Date(rd)
+
+  # training data 
+  stage3_trim <- noaa_past_mean %>%
+    mutate(datetime = as.Date(datetime)) %>%
+    filter(datetime < reference_date)
+
+  target <- targets %>%
+    mutate(datetime = as.Date(datetime)) %>%
+    filter(datetime < reference_date)
+  # Add water temp lag and 3 day mean air temp (including today's air temp)
+  targets_df <- target %>%
+    pivot_wider(names_from = variable, values_from = observation) %>%
+    left_join(stage3_trim, by = c("datetime", "site_id")) %>%
+    arrange(site_id, datetime) %>%
+    group_by(site_id) %>%
+    mutate(
+      wtemp_yday = lag(temperature, 1),
+      airtemp_yday = slide_dbl(
+        air_temperature,
+        ~ mean(.x, na.rm = TRUE),
+        .before = 2,
+        .after = 0,
+        .complete = TRUE
+      )
+    ) %>%
+    ungroup() %>%
+    drop_na(temperature, air_temperature, wtemp_yday, airtemp_yday)
+
+
+  # fit model
+  fit <- lm(
+    temperature ~ air_temperature + wtemp_yday + airtemp_yday,
+    data = targets_df
+  )
+  fit_summary <- summary(fit)
+
+  coeffs <- coef(fit)
+  params_se <- fit_summary$coefficients[, 2]
+
+  mod <- predict(fit, newdata = targets_df)
+  residuals <- mod - targets_df$temperature
+  sigma <- sd(residuals, na.rm = TRUE)
+
+  # parameter uncertainty
+  param_df <- tibble(
+    ensemble_member = 1:n_members,
+    beta1 = rnorm(n_members, coeffs[1], params_se[1]),
+    beta2 = rnorm(n_members, coeffs[2], params_se[2]),
+    beta3 = rnorm(n_members, coeffs[3], params_se[3]),
+    beta4 = rnorm(n_members, coeffs[4], params_se[4])
+  )
+
+  # NOAA future
+  df_future <- neon4cast::noaa_stage2(start_date = as.character(reference_date))
+
+  noaa_future <- df_future %>%
+    dplyr::filter(
+      site_id == "BARC",
+      variable == "air_temperature"
+    ) %>%
+    dplyr::collect()
+
+  noaa_future_daily <- noaa_future %>%
+    mutate(
+      datetime = as.Date(datetime),
+      reference_datetime = as.Date(reference_datetime)
+    ) %>%
+    filter(
+      reference_datetime == reference_date,
+      datetime > reference_date   # future days only; day 0 comes from observed met below
+    ) %>%
+    summarize(
+      prediction = mean(prediction),
+      .by = c(datetime, site_id, parameter, variable, reference_datetime)
+    ) %>%
+    pivot_wider(names_from = variable, values_from = prediction) %>%
+    mutate(air_temperature = air_temperature - 273.15) %>%
+    select(datetime, site_id, air_temperature, parameter, reference_datetime) %>%
+    arrange(parameter, datetime)
+
+  if (nrow(noaa_future_daily) == 0) next
+
+  # past + observed met used to create 3-day air temp lag 
+  past_air <- noaa_past_mean %>%
+    mutate(datetime = as.Date(datetime)) %>%
+    filter(
+      site_id == "BARC",
+      datetime >= reference_date - days(2),
+      datetime <= reference_date
+    ) %>%
+    select(datetime, site_id, air_temperature) %>%
+    crossing(noaa_future_daily %>% distinct(parameter)) %>%
+    mutate(reference_datetime = reference_date) %>%
+    arrange(parameter, datetime)
+
+  # combine past + future met and calc 3-day mean air temp
+  air_for_lags <- bind_rows(
+    past_air,
+    noaa_future_daily %>%
+      select(datetime, site_id, air_temperature, parameter, reference_datetime)
+  ) %>%
+    arrange(parameter, datetime) %>%
+    group_by(parameter) %>%
+    mutate(
+      airtemp_lag3 = slide_dbl(
+        air_temperature,
+        ~ mean(.x, na.rm = TRUE),
+        .before = 2,
+        .after = 0,
+        .complete = TRUE
+      )
+    ) %>%
+    ungroup() %>%
+    drop_na(airtemp_lag3)
+
+  # these are the dates we will predict
+  # first date should be reference_date itself which is horizon 0
+  forecasted_dates <- sort(unique(air_for_lags$datetime[air_for_lags$datetime >= reference_date]))
+
+  if (length(forecasted_dates) == 0) next
+
+  # initial condition comes from observed water temp on day -1
+  init_watertemp <- target %>%
+    filter(
+      site_id == "BARC",
+      variable == "temperature",
+      datetime == reference_date - days(1)
+    ) %>%
+    pull(observation)
+
+  if (length(init_watertemp) != 1 || is.na(init_watertemp)) next
+
+  ic_sd <- 0.1
+
+  ic_df <- tibble(
+    datetime = rep(reference_date - days(1), n_members),
+    ensemble_member = 1:n_members,
+    forecast_variable = "water_temperature",
+    value = rnorm(n_members, mean = init_watertemp, sd = ic_sd),
+    uc_type = "initial_condition"
+  )
+
+  all_model_dates <- c(reference_date - days(1), forecasted_dates)
+
+  forecast_total_unc <- tibble(
+    datetime = rep(all_model_dates, times = n_members),
+    ensemble_member = rep(1:n_members, each = length(all_model_dates)),
+    forecast_variable = "water_temperature",
+    value = as.double(NA),
+    uc_type = "total"
+  ) %>%
+    rows_update(
+      ic_df,
+      by = c("datetime", "ensemble_member", "forecast_variable")
+    )
+
+  # recursive forecast
+  for (j in seq_along(forecasted_dates)) {
+
+    curr_date <- forecasted_dates[j]
+    prev_date <- if (j == 1) reference_date - days(1) else forecasted_dates[j - 1]
+
+    temp_pred <- forecast_total_unc %>%
+      filter(datetime == curr_date) %>%
+      arrange(ensemble_member)
+
+    air_lag <- air_for_lags %>%
+      filter(datetime == curr_date) %>%
+      arrange(parameter)
+
+    temp_lag <- forecast_total_unc %>%
+      filter(datetime == prev_date) %>%
+      arrange(ensemble_member)
+
+    temp_pred$value <- param_df$beta1 +
+      air_lag$air_temperature * param_df$beta2 +
+      temp_lag$value * param_df$beta3 +
+      air_lag$airtemp_lag3 * param_df$beta4 +
+      rnorm(n = n_members, mean = 0, sd = sigma)
+
+    temp_pred$uc_type <- "total"
+
+    forecast_total_unc <- forecast_total_unc %>%
+      rows_update(
+        temp_pred,
+        by = c("datetime", "ensemble_member", "forecast_variable")
+      )
+  }
+
+
+  curr_site_df <- forecast_total_unc %>%
+    mutate(
+      reference_datetime = reference_date,
+      horizon = as.integer(datetime - reference_datetime),
+      site_id = "BARC",
+      variable = "temperature",
+      parameter = ensemble_member,
+      prediction = value
+    ) %>%
+    select(
+      reference_datetime,
+      datetime,
+      horizon,
+      site_id,
+      parameter,
+      prediction,
+      variable,
+      uc_type
+    )
+
+  forecast_df <- bind_rows(forecast_df, curr_site_df)
+}
+```
+
+```{r}
+all_results <- open_dataset("s3://bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature", 
+                            s3_endpoint = "sdsc.osn.xsede.org", 
+                            anonymous = TRUE)
+my_forecasts <- all_results |> 
+  filter(
+    site_id == "BARC",
+    model_id %in% c("climatology", "persistenceRW")) |> 
+  collect()
+
+forecast_dates = unique(my_forecasts$datetime)
+
+obs <- read_csv("https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz")
+
+
+multi_forecast_ensemble <- my_forecasts |> 
+  filter(model_id == "persistenceRW") |> 
+  left_join(obs, by = c("datetime", "site_id", "variable")) |> 
+  mutate(horizon = as.numeric(datetime - reference_datetime, units="days"))|>
+  select(model_id, datetime, prediction, observation, parameter, horizon) |>
+  arrange(datetime)
+
+multi_forecast_parametric <- my_forecasts |> 
+  filter(model_id == "climatology") |>
+  left_join(obs, by = c("datetime", "site_id", "variable")) |> 
+  mutate(horizon = as.numeric(datetime - reference_datetime, units="days"))|>
+  select(model_id, datetime, prediction, observation, parameter, horizon) |>
+  arrange(datetime)|>
+  pivot_wider(
+    names_from = parameter,
+    values_from = prediction,
+    values_fn = mean
+  )
+
+
+multi_forecast_ensemble2 <- forecast_df |> 
+  mutate(model_id = "Steve") |> 
+  left_join(obs, by = c("datetime", "site_id", "variable")) |> 
+  select(reference_datetime, model_id, datetime, prediction, observation, parameter, horizon) |>
+  arrange(reference_datetime, datetime, parameter)
+
+
+normal_crps <- multi_forecast_parametric |> 
+  group_by(datetime, model_id, horizon) |> 
+  summarize(crps = crps_norm(observation, mean = mu, sd = sigma)) |>
+  filter(!is.na(crps))
+
+
+
+crps_tidy_ensemble <- function(prediction, observation) {
+  obs <- observation[1] #all the observations are the same for each row, but we only need one
+  crps_sample(obs, prediction)
+}
+
+#Use the function
+ensemble_crps <- multi_forecast_ensemble |> 
+  filter(!is.na(observation), !is.na(prediction)) |> 
+  group_by(datetime, model_id, horizon) |> 
+  summarize(crps = crps_tidy_ensemble(prediction, observation)) 
+
+#Use the function
+ensemble_crps2 <- multi_forecast_ensemble2 |> 
+  filter(!is.na(observation), !is.na(prediction)) |> 
+  filter(!horizon == -1) |>
+  group_by(reference_datetime, datetime, model_id, horizon) |> 
+  summarize(crps = crps_tidy_ensemble(prediction, observation))  |>
+  arrange(reference_datetime, horizon)
+
+
+```
+
+```{r}
+
+filt_normal_crps <- normal_crps %>%
+  filter(as.Date(datetime) %in% as.Date(ref_datetimes))
+
+filt_ensemble_crps <- ensemble_crps %>%
+  filter(as.Date(datetime) %in% as.Date(ref_datetimes))
+
+filt_ensemble_crps2 <- ensemble_crps2 %>%
+  filter(as.Date(datetime) %in% as.Date(ref_datetimes))
+
+```
+
+```{r}
+
+crps_by_horizon <- bind_rows(
+  filt_normal_crps,
+  filt_ensemble_crps,
+  filt_ensemble_crps2
+) |>
+  group_by(model_id, horizon) |>
+  summarize(
+    mean_crps = mean(crps, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(crps_by_horizon, aes(x = horizon, y = mean_crps, color = model_id)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    x = "Horizon",
+    y = "Mean CRPS",
+    color = "Model"
+  ) 
+```
